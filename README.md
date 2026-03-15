@@ -230,39 +230,104 @@ Three sources are joined into a single `profile_input` DataFrame keyed on `custo
 
 Customers without barista notes get the default: `"No barista notes available."`.
 
+```python
+# Aggregate barista notes into date-stamped text per customer
+customer_notes = (
+    barista_notes
+    .groupBy("customer_id")
+    .agg(
+        F.concat_ws(
+            "\n- ",
+            F.collect_list(
+                F.concat(F.lit("["), F.col("note_date").cast("string"), F.lit("] "), F.col("note"))
+            )
+        ).alias("barista_notes_text")
+    )
+)
+
+# Join: structured features + barista notes + favorite drink metadata
+profile_input = (
+    customer_drink_features
+    .join(customer_notes, "customer_id", "left")
+    .join(
+        drinks.select(
+            F.col("drink_id"),
+            F.col("name").alias("fav_drink_name"),
+            F.col("flavor_profile").alias("fav_drink_flavor"),
+            F.col("description").alias("fav_drink_description"),
+            F.col("base_type").alias("fav_drink_base"),
+        ),
+        customer_drink_features["top_drink_id"] == drinks["drink_id"],
+        "left"
+    )
+    .fillna({"barista_notes_text": "No barista notes available."})
+)
+
+profile_input.createOrReplaceTempView("profile_input")
+```
+
 #### Step 2: Two `ai_query` Calls in One SQL Pass
 
-The SQL `SELECT` generates both features simultaneously using two `ai_query` calls with different prompts:
+The SQL `SELECT` generates both features simultaneously using two `ai_query` calls with different prompts. Here is the full query:
 
-**Profile Summary Prompt** — detailed internal brief:
+```sql
+SELECT
+  customer_id,
+
+  -- Feature 1: Profile Summary (detailed internal brief for barista training / mobile app)
+  ai_query(
+    'databricks-meta-llama-3-3-70b-instruct',
+    CONCAT(
+      'You are a Starbucks barista AI. Generate a concise customer profile (3-4 sentences) ',
+      'that would help a barista know exactly what this regular wants before they even order. ',
+      'Be specific and actionable.\n\n',
+      'CUSTOMER: ', customer_id, ' (', loyalty_tier, ' member)\n',
+      'MILK: ', milk_preference,
+      CASE WHEN prefers_less_sugar THEN ' | LESS SUGAR' ELSE '' END,
+      CASE WHEN prefers_decaf THEN ' | DECAF' ELSE '' END, '\n',
+      'VISITS: ', typical_visit_time, ' regular, ~', CAST(orders_per_week AS STRING), ' orders/week\n',
+      'FAVORITE: ', top_drink_name, ' (', CAST(ROUND(total_orders * 0.4, 0) AS INT), '+ times) — ',
+      fav_drink_flavor, '\n',
+      'ALSO ORDERS: ', CAST(unique_drinks_tried AS STRING), ' different drinks tried\n',
+      'PREFERRED SIZE: ', preferred_size, '\n',
+      'CUSTOMIZATIONS SEEN: ', customization_history, '\n',
+      'AVG CAFFEINE: ', CAST(avg_caffeine_mg AS STRING), 'mg | AVG CALORIES: ',
+      CAST(avg_calories AS STRING), '\n\n',
+      'BARISTA NOTES:\n- ', barista_notes_text, '\n\n',
+      'Write the profile as if briefing a new barista about this regular. Focus on: ',
+      '(1) their go-to order with exact customizations, ',
+      '(2) any known preferences or pet peeves, ',
+      '(3) personality/vibe that helps the interaction.'
+    )
+  ) AS profile_summary,
+
+  -- Feature 2: Barista Greeting (customer-facing, ready to use at the register)
+  ai_query(
+    'databricks-meta-llama-3-3-70b-instruct',
+    CONCAT(
+      'You are a friendly Starbucks barista. Generate a SHORT, natural greeting ',
+      'for a regular customer who just scanned their loyalty card. The greeting should:\n',
+      '1. Use their name if known\n',
+      '2. Predict their most likely order with specific customizations\n',
+      '3. Ask for confirmation in a casual, friendly way\n',
+      '4. Reference something personal if relevant (time of day, recent changes, etc.)\n\n',
+      'CUSTOMER: ', customer_id, ' (', loyalty_tier, ' member)\n',
+      'TOP DRINK: ', top_drink_name, ' (', preferred_size, ')\n',
+      'MILK: ', milk_preference,
+      CASE WHEN prefers_less_sugar THEN ' | less sugar' ELSE '' END,
+      CASE WHEN prefers_decaf THEN ' | decaf' ELSE '' END, '\n',
+      'VISITS: ', typical_visit_time, ' regular, ~', CAST(orders_per_week AS STRING), '/week\n',
+      'CUSTOMIZATIONS: ', customization_history, '\n',
+      'BARISTA NOTES:\n- ', barista_notes_text, '\n\n',
+      'Generate ONLY the greeting — 2-3 sentences max. Sound human, not robotic. No quotation marks.'
+    )
+  ) AS barista_greeting,
+
+  current_timestamp() AS profile_generated_at
+FROM profile_input
 ```
-You are a Starbucks barista AI. Generate a concise customer profile (3-4 sentences)...
 
-CUSTOMER: {customer_id} ({loyalty_tier} member)
-MILK: {milk_preference} [ | LESS SUGAR] [ | DECAF]
-VISITS: {typical_visit_time} regular, ~{orders_per_week} orders/week
-FAVORITE: {top_drink_name} ({total_orders * 0.4}+ times) — {fav_drink_flavor}
-ALSO ORDERS: {unique_drinks_tried} different drinks tried
-PREFERRED SIZE: {preferred_size}
-CUSTOMIZATIONS SEEN: {customization_history}
-AVG CAFFEINE: {avg_caffeine_mg}mg | AVG CALORIES: {avg_calories}
-
-BARISTA NOTES:
-- {barista_notes_text}
-```
-
-**Barista Greeting Prompt** — customer-facing output:
-```
-You are a friendly Starbucks barista. Generate a SHORT, natural greeting...
-
-CUSTOMER: {customer_id} ({loyalty_tier} member)
-TOP DRINK: {top_drink_name} ({preferred_size})
-MILK: {milk_preference} [ | less sugar] [ | decaf]
-VISITS: {typical_visit_time} regular, ~{orders_per_week}/week
-CUSTOMIZATIONS: {customization_history}
-BARISTA NOTES:
-- {barista_notes_text}
-```
+Note how both `ai_query` calls reference the same columns from the `profile_input` view but with different system prompts and instructions. The profile prompt asks for a detailed 3-4 sentence brief; the greeting prompt asks for a casual 2-3 sentence customer-facing greeting. Spark executes both calls per row in a single pass over the data.
 
 #### Step 3: What Gets Stored (Example — C001 Sarah Chen)
 
